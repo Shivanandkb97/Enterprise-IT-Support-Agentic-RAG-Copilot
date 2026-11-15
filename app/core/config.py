@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     pinecone_api_key: str = ""
     pinecone_index_name: str = ""
     pinecone_namespace: str = ""
-    embedding_model: str = ""
+    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
     groq_model: str = ""
     top_k: int = 4
     max_retries: int = 1
