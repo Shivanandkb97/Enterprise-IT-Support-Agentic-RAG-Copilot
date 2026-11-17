@@ -1,6 +1,7 @@
 
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Header
@@ -14,9 +15,14 @@ from app.rag.vectorstore import add_documents
 from app.services.ingestion import (
     load_file,
     chunk_documents,
-    SUPPORTED_FILE_FORMATS
+    calculate_file_hash,
+    SUPPORTED_FILE_FORMATS,
 )
-from app.services.audit import write_audit
+from app.services.audit import (
+    write_audit,
+    is_document_duplicate,
+    register_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +87,6 @@ async def chat(payload: CharRequest):
                 stream_mode=["updates", "messages"],
             ):
 
-                # Receive generated LLM tokens
                 if mode == "messages":
 
                     message, metadata = chunk
@@ -117,7 +122,6 @@ async def chat(payload: CharRequest):
                                 "content": token,
                             })
 
-                # Receive completed node updates
                 elif mode == "updates":
 
                     for node, output in chunk.items():
@@ -134,7 +138,6 @@ async def chat(payload: CharRequest):
                             if key in output:
                                 final_data[key] = output[key]
 
-                        # Send workflow trace updates
                         node_trace = output.get("trace", [])
 
                         if node_trace:
@@ -149,7 +152,6 @@ async def chat(payload: CharRequest):
                                     "message": latest_trace,
                                 })
 
-                        # Send workflow status
                         statuses = {
                             "route_question": "Understanding your question...",
                             "retrieve_kb": "Searching company knowledge...",
@@ -169,14 +171,12 @@ async def chat(payload: CharRequest):
                                 "message": statuses[node],
                             })
 
-            # Record completed request
             write_audit(
                 payload.question,
                 final_data["source_used"],
                 final_data["trace"],
             )
 
-            # Send final response metadata
             yield sse_event({
                 "type": "final",
                 **final_data,
@@ -206,13 +206,16 @@ async def ingest(
     file: UploadFile = File(...),
     x_admin_key: str = Header(default="")
 ):
+    # 1. Validate admin key
     if x_admin_key != settings.admin_api_key:
         raise HTTPException(
             status_code=401,
             detail="Invalid admin key"
         )
 
-    suffix = Path(file.filename or "").suffix.lower()
+    # 2. Validate file extension
+    original_name = Path(file.filename or "").name
+    suffix = Path(original_name).suffix.lower()
 
     if suffix not in SUPPORTED_FILE_FORMATS:
         raise HTTPException(
@@ -220,19 +223,107 @@ async def ingest(
             detail=f"Supported: {', '.join(sorted(SUPPORTED_FILE_FORMATS))}"
         )
 
+    # 3. Read uploaded file
+    file_bytes = await file.read()
+
+    if not file_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty."
+        )
+
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = upload_dir / Path(file.filename).name
-    dest.write_bytes(await file.read())
+    # Use a unique internal filename to prevent overwriting
+    # another document with the same original filename.
+    stored_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
 
-    docs = load_file(dest)
-    chunks = chunk_documents(docs)
-    ids = add_documents(chunks)
+    try:
+        stored_path.write_bytes(file_bytes)
 
-    return {
-        "message": "Document indexed",
-        "file": dest.name,
-        "chunks": len(chunks),
-        "ids_created": len(ids)
-    }
+        # 4. Calculate SHA-256 hash
+        file_hash = calculate_file_hash(stored_path)
+
+        # 5. Check whether document already exists
+        if is_document_duplicate(file_hash):
+            logger.info("Duplicate document detected: %s", original_name)
+
+            return {
+                "status": "duplicate",
+                "duplicate": True,
+                "message": "This document has already been uploaded and indexed.",
+                "file": original_name,
+                "chunks": 0,
+                "ids_created": 0,
+            }
+
+        # 6. Load and chunk document
+        docs = load_file(stored_path)
+
+        # Preserve the original filename in document metadata
+        for doc in docs:
+            doc.metadata["source"] = original_name
+
+        chunks = chunk_documents(docs)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No readable content found in the uploaded document."
+            )
+
+        # 7. Add document chunks to Pinecone
+        ids = add_documents(chunks)
+
+        # 8. Register document only after successful indexing
+        registered = register_document(original_name, file_hash)
+
+        if not registered:
+            logger.warning(
+                "Document was indexed, but its hash was already registered: %s",
+                original_name
+            )
+
+        logger.info(
+            "Document indexed successfully: %s (%s chunks)",
+            original_name,
+            len(chunks)
+        )
+
+        return {
+            "status": "success",
+            "duplicate": False,
+            "message": "Document indexed successfully.",
+            "file": original_name,
+            "chunks": len(chunks),
+            "ids_created": len(ids),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Document ingestion failed: %s", original_name)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong while processing the document."
+        )
+
+    finally:
+        await file.close()
+
+        # Remove temporary file if it was not successfully registered.
+        # Successfully indexed documents remain in the upload directory.
+        if stored_path.exists():
+            try:
+                if not is_document_duplicate(
+                    calculate_file_hash(stored_path)
+                ):
+                    stored_path.unlink()
+            except Exception:
+                logger.exception(
+                    "Could not clean up uploaded file: %s",
+                    stored_path
+                )

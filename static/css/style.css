@@ -643,3 +643,7 @@ body {
         opacity: 1;
     }
 }
+
+.upload-status.warning {
+    color: #e5a000;
+}

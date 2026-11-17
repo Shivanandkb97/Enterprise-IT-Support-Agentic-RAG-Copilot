@@ -16,6 +16,36 @@ function escapeHtml(s = '') {
     }[c]));
 }
 
+
+
+function getErrorMessage(errorData) {
+    const detail = errorData?.detail;
+
+    if (Array.isArray(detail)) {
+        return detail.map(error => {
+            const message = error.msg || '';
+
+            if (message.includes('at least 2 characters')) {
+                return 'Please ask something valid.Your message must contain at least 2 characters.';
+            }
+
+            if (message.includes('at most 3000 characters')) {
+                return 'Your question is too long. Please keep it under 3000 characters.';
+            }
+
+            return 'Please check your input and try again.';
+        }).join(' ');
+    }
+
+    if (typeof detail === 'string') {
+        return detail;
+    }
+
+    return 'Something went wrong. Please try again.';
+}
+
+
+
 // Render Markdown safely
 function formatText(s = '') {
     if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
@@ -132,8 +162,14 @@ function appendToken(token, ui, answer) {
 
 // Add final source and citations
 function finishStreaming(data, ui) {
+
     if (ui.status && ui.status.isConnected) {
         ui.status.remove();
+    }
+
+    // Fallback if no tokens were received
+    if (!ui.content.textContent.trim() && data.answer) {
+        ui.content.innerHTML = formatText(data.answer);
     }
 
     if (data.source_used) {
@@ -243,9 +279,9 @@ async function askAgent(q) {
     // Show assistant message immediately
     const ui = createStreamingMessage();
 
-    updateStatus('Understanding your question...', ui);
+    updateStatus('Thinking...', ui);
 
-    renderTrace(['Starting LangGraph workflow...']);
+    renderTrace(['Generating...']);
     sourceUsed.textContent = 'Running';
 
     const answer = { value: '' };
@@ -271,7 +307,7 @@ async function askAgent(q) {
 
             try {
                 const errorData = await res.json();
-                errorMessage = errorData.detail || errorMessage;
+                errorMessage = getErrorMessage(errorData);
             } catch {
                 // Keep default error message
             }
@@ -388,8 +424,16 @@ form.addEventListener('submit', e => {
 
     const q = question.value.trim();
 
-    if (q) {
+    if (q && !form.querySelector('button').disabled) {
         askAgent(q);
+    }
+});
+
+// Press Enter to send the message
+question.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        form.requestSubmit();
     }
 });
 
@@ -506,26 +550,62 @@ uploadBtn.addEventListener('click', async () => {
             throw new Error(d.detail || 'Document upload failed.');
         }
 
-        const successMessage =
-            `Successfully indexed ${d.file || file.name}` +
-            (d.chunks !== undefined ? ` (${d.chunks} chunks).` : '.');
+        // ======================================
+        // HANDLE DUPLICATE DOCUMENT
+        // ======================================
 
-        setUploadStatus(successMessage, 'success');
+        if (d.duplicate === true || d.status === 'duplicate') {
 
-        // Notify user in chat if modal was closed
-        if (modal.classList.contains('hidden')) {
-            addMessage(
-                'assistant',
-                `Your document **${d.file || file.name}** has been uploaded and indexed successfully. You can now ask questions about it.`
+            const duplicateMessage =
+                `${d.file || file.name} is already present in your company's private knowledge base. No new indexing was performed.`;
+
+            setUploadStatus(
+                duplicateMessage,
+                'warning'
             );
+
+            // Notify user in chat if modal was closed
+            if (modal.classList.contains('hidden')) {
+                addMessage(
+                    'assistant',
+                    `**Duplicate document detected!**\n\n${escapeHtml(d.file || file.name)} is already present in your company's private knowledge base. No new indexing was performed.`
+                );
+            }
+
+        } else {
+
+            // ======================================
+            // HANDLE SUCCESSFUL DOCUMENT UPLOAD
+            // ======================================
+
+            const successMessage =
+                `Successfully indexed ${d.file || file.name}` +
+                (d.chunks !== undefined ? ` (${d.chunks} chunks).` : '.');
+
+            setUploadStatus(
+                successMessage,
+                'success'
+            );
+
+            // Notify user in chat if modal was closed
+            if (modal.classList.contains('hidden')) {
+                addMessage(
+                    'assistant',
+                    `Your document **${escapeHtml(d.file || file.name)}** has been uploaded and indexed successfully. You can now ask questions about it.`
+                );
+            }
         }
 
         fileInput.value = '';
 
     } catch (e) {
+
         const errorMessage = `Upload failed: ${e.message}`;
 
-        setUploadStatus(errorMessage, 'error');
+        setUploadStatus(
+            errorMessage,
+            'error'
+        );
 
         // Notify user in chat if modal was closed
         if (modal.classList.contains('hidden')) {
@@ -533,6 +613,7 @@ uploadBtn.addEventListener('click', async () => {
         }
 
     } finally {
+
         uploadInProgress = false;
 
         uploadBtn.disabled = false;
