@@ -44,7 +44,7 @@ def add_trace(state: AgentState, message: str):
     return [*state.get("trace", []), message]
 
 def route_question(state: AgentState):
-    router = llm().with_structured_output(RouteDecision, method="json_schema")
+    router = llm().with_structured_output(RouteDecision, method="json_mode")
     
     decision = router.invoke(f"""
     You are a routing classifier for an enterprise IT support assistant.
@@ -74,7 +74,11 @@ def route_question(state: AgentState):
     - When uncertain, ALWAYS choose "kb".
     - Never choose "direct" for technical or informational questions.
     - Do not answer the user's question.
-    - Return only a valid structured routing decision.
+    - Return ONLY valid JSON. Do not include Markdown or explanations.
+    - The response must follow this JSON format:
+    {{"route": "kb"}}
+    or
+    {{"route": "direct"}}
 
     User message: {state['question']}
     """)
@@ -91,7 +95,7 @@ def retrieve_kb(state: AgentState):
 def grade_kb(state: AgentState):
     grader = llm().with_structured_output(
         EvidenceGrade,
-        method="json_schema"
+        method="json_mode"
     )
 
     context = "\n\n".join(
@@ -131,8 +135,10 @@ IMPORTANT:
 - Do not assume that keyword similarity means sufficient evidence.
 - When uncertain, always return "weak".
 
-Return the structured result with exactly one grade:
-"good" or "weak".
+Return ONLY valid JSON in this format:
+{{"grade": "good"}}
+or
+{{"grade": "weak"}}
 """)
 
     return {
@@ -168,7 +174,7 @@ def search_web(state: AgentState):
 def grade_web(state: AgentState):
     grader = llm().with_structured_output(
         EvidenceGrade,
-        method="json_schema"
+        method="json_mode"
     )
 
     if not state["web_results"].strip():
@@ -214,8 +220,10 @@ IMPORTANT:
 - Do not treat keyword similarity as sufficient evidence.
 - When uncertain, always return "weak".
 
-Return the structured result with exactly one grade:
-"good" or "weak".
+Return ONLY valid JSON in this format:
+{{"grade": "good"}}
+or
+{{"grade": "weak"}}
 """)
 
     return {
