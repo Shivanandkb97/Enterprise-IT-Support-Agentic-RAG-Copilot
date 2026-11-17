@@ -22,6 +22,7 @@ def llm():
             model=settings.groq_model,
             temperature=0,
             api_key=settings.groq_api_key,
+            streaming=True,
         )
     return _llm
 
@@ -44,17 +45,40 @@ def add_trace(state: AgentState, message: str):
 
 def route_question(state: AgentState):
     router = llm().with_structured_output(RouteDecision, method="json_schema")
+    
     decision = router.invoke(f"""
-You route messages for an enterprise IT support assistant.
-Use direct only for greetings, thanks, or casual chat that needs no company knowledge.
-Use kb for questions about company IT policies, VPN, password reset, MFA, laptop setup,
-software access, security, email, devices, troubleshooting, or technology support.
-IMPORTANT:
-When in doubt, always choose "kb".
-Never choose "direct" for technical questions.
-Question: {state['question']}
-Return valid JSON like {{"route":"kb"}}.
-""")
+    You are a routing classifier for an enterprise IT support assistant.
+
+    Your task is to classify the user's message into exactly one route:
+
+    1. "direct":
+    Use ONLY for:
+    - Greetings (Hi, Hello, Good morning).
+    - Thanks and acknowledgements.
+    - Casual conversations and simple small talk.
+    - Simple conversational messages that do not require IT knowledge.
+
+    2. "kb":
+    Use for:
+    - Company IT policies and procedures.
+    - VPN, password resets, and MFA.
+    - Laptop and device setup.
+    - Software installation and access.
+    - Email and network troubleshooting.
+    - Cybersecurity and access management.
+    - Technical questions and general IT-related information.
+    - Any question requiring factual knowledge or explanation.
+    - Questions that may require private knowledge base retrieval or web search.
+
+    IMPORTANT RULES:
+    - When uncertain, ALWAYS choose "kb".
+    - Never choose "direct" for technical or informational questions.
+    - Do not answer the user's question.
+    - Return only a valid structured routing decision.
+
+    User message: {state['question']}
+    """)
+
     return {"source_used": decision.route, "trace": add_trace(state, f"Router → {decision.route.upper()}")}
 
 def route_after_router(state: AgentState) -> Literal["retrieve_kb", "direct_answer"]:
@@ -65,16 +89,59 @@ def retrieve_kb(state: AgentState):
     return {"kb_docs": docs, "trace": add_trace(state, f"Private KB retrieval → {len(docs)} chunks")}
 
 def grade_kb(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_schema")
-    context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
+    grader = llm().with_structured_output(
+        EvidenceGrade,
+        method="json_schema"
+    )
+
+    context = "\n\n".join(
+        f"Source: {d.metadata.get('source', 'unknown')}\n{d.page_content}"
+        for d in state["kb_docs"]
+    )
+
     grade = grader.invoke(f"""
-You grade evidence for an enterprise IT support assistant.
-Question: {state['question']}
-Private company KB evidence:\n{context}
-Return good only if the evidence is sufficient to answer confidently and specifically.
-Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
+You are an evidence evaluator for an enterprise IT support assistant.
+
+Your task is to determine whether the retrieved private company
+knowledge base documents contain sufficient evidence to answer
+the user's question accurately.
+
+User question:
+{state['question']}
+
+Retrieved private KB evidence:
+{context}
+
+Evaluation criteria:
+
+Return "good" ONLY when:
+- The evidence is directly relevant to the question.
+- It contains enough information to provide a clear and specific answer.
+- Important steps, requirements, or policy details are supported by the evidence.
+- The answer can be generated without making assumptions.
+
+Return "weak" when:
+- No relevant documents were retrieved.
+- The evidence is incomplete or unrelated.
+- Important information is missing.
+- Answering would require guessing or inventing company-specific details.
+
+IMPORTANT:
+- Do not use your general knowledge to fill gaps.
+- Do not assume that keyword similarity means sufficient evidence.
+- When uncertain, always return "weak".
+
+Return the structured result with exactly one grade:
+"good" or "weak".
 """)
-    return {"kb_grade": grade.grade, "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}")}
+
+    return {
+        "kb_grade": grade.grade,
+        "trace": add_trace(
+            state,
+            f"KB evidence grade → {grade.grade.upper()}"
+        ),
+    }
 
 def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
     return "generate_from_kb" if state["kb_grade"] == "good" else "search_web"
@@ -99,14 +166,65 @@ def search_web(state: AgentState):
     }
 
 def grade_web(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_schema")
+    grader = llm().with_structured_output(
+        EvidenceGrade,
+        method="json_schema"
+    )
+
+    if not state["web_results"].strip():
+        return {
+            "web_grade": "weak",
+            "trace": add_trace(
+                state,
+                "Web evidence grade → WEAK (no search results)"
+            ),
+        }
+
     grade = grader.invoke(f"""
-Question: {state['question']}
-Web evidence:\n{state['web_results']}
-Return good if the evidence is sufficient and directly relevant; otherwise weak.
-Return valid JSON like {{"grade":"good"}}.
+You are an evidence evaluator for an enterprise IT support assistant.
+
+Your task is to determine whether the external web search results
+provide sufficient and reliable information to answer the user's question.
+
+User question:
+{state['question']}
+
+External web evidence:
+{state['web_results']}
+
+Evaluation criteria:
+
+Return "good" ONLY when:
+- The search results are directly relevant to the question.
+- The evidence contains enough specific information to answer confidently.
+- The information is supported by the provided search results.
+- The sources appear relevant and trustworthy.
+- The answer can be generated without unsupported assumptions.
+
+Return "weak" when:
+- Search results are empty, unrelated, or irrelevant.
+- Important information is missing.
+- Results contain conflicting or insufficient information.
+- The evidence does not support a reliable answer.
+- Answering would require guessing.
+
+IMPORTANT:
+- Evaluate only the provided web evidence.
+- Do not use your general knowledge to fill missing information.
+- Do not treat keyword similarity as sufficient evidence.
+- When uncertain, always return "weak".
+
+Return the structured result with exactly one grade:
+"good" or "weak".
 """)
-    return {"web_grade": grade.grade, "trace": add_trace(state, f"Web evidence grade → {grade.grade.upper()}")}
+
+    return {
+        "web_grade": grade.grade,
+        "trace": add_trace(
+            state,
+            f"Web evidence grade → {grade.grade.upper()}"
+        ),
+    }
 
 def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query", "insufficient"]:
     if state["web_grade"] == "good":
@@ -117,50 +235,139 @@ def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query"
 
 def rewrite_query(state: AgentState):
     rewritten = llm().invoke(f"""
-Rewrite this IT support question for better private knowledge retrieval and vendor web search.
-Preserve intent, add useful technical keywords, do not answer, return only the query.
-Question: {state['question']}
+You are a query optimization assistant for an enterprise IT support system.
+
+Rewrite the user's question to improve:
+1. Private knowledge base retrieval.
+2. External web search.
+
+Instructions:
+- Preserve the original intent and meaning.
+- Add relevant technical keywords and terminology where appropriate.
+- Include useful product names, technologies, or error terminology
+  only when supported by the original question.
+- Remove unnecessary words and ambiguity.
+- Do not answer the question.
+- Do not introduce assumptions or unrelated information.
+- Return ONLY the rewritten search query.
+- Keep the query concise and specific.
+
+Original question:
+{state['question']}
 """).content.strip()
+
     return {
         "current_query": rewritten,
         "retry_count": state["retry_count"] + 1,
-        "trace": add_trace(state, f"Query rewrite → {rewritten}"),
+        "trace": add_trace(
+            state,
+            f"Query rewrite → {rewritten}"
+        ),
     }
 
 def generate_from_kb(state: AgentState):
-    context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
+    context = "\n\n".join(
+        f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}"
+        for d in state["kb_docs"]
+    )
+
     answer = llm().invoke(f"""
-You are an enterprise IT support copilot. Answer ONLY from the private company KB below.
-Be concise, actionable, and safe. If steps are present, present them clearly.
-Do not invent policy details. Mention that the answer is based on the company's private knowledge base.
-Question: {state['question']}\n\nPrivate KB:\n{context}
+You are an enterprise IT support copilot.
+
+Answer ONLY using the private company knowledge base provided below.
+
+Instructions:
+- Be concise, clear, and actionable.
+- Present instructions as numbered steps when appropriate.
+- Do not invent facts, procedures, or company policies.
+- If the knowledge base does not contain the required information,
+  clearly mention the limitation.
+- Mention that the answer is based on the company's private knowledge base.
+- Do not refer to external web searches.
+
+User question:
+{state['question']}
+
+Private company knowledge base:
+{context}
 """).content
-    citations = []
-    seen = set()
-    for d in state["kb_docs"]:
-        src = d.metadata.get("source", "Private KB")
-        if src not in seen:
-            seen.add(src)
-            citations.append({"title": src.split("/")[-1], "url": "", "type": "private_kb"})
-    return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
+
+    return {
+        "answer": answer,
+        "source_used": "private_kb",
+        "citations": [],
+        "trace": add_trace(
+            state,
+            "Answer generation → PRIVATE KB"
+        ),
+    }
 
 def generate_from_web(state: AgentState):
     answer = llm().invoke(f"""
-You are an enterprise IT support copilot. The private company KB was insufficient.
-Answer ONLY from the web evidence below. Clearly say this is external web information and may need IT validation before changing company-managed systems.
-Question: {state['question']}\n\nWeb evidence:\n{state['web_results']}
+You are an enterprise IT support copilot.
+
+The private company knowledge base did not contain sufficient evidence.
+Use ONLY the external web evidence provided below.
+
+Instructions:
+- Answer the user's question clearly and accurately.
+- Do not invent facts or instructions.
+- If the evidence does not fully answer the question, clearly mention the limitation.
+- Provide step-by-step instructions when appropriate.
+- Clearly state that the answer is based on external web information.
+- Warn the user to validate instructions with their IT team before
+  making changes to company-managed systems.
+- Keep the response concise and professional.
+
+User question:
+{state['question']}
+
+External web evidence:
+{state['web_results']}
 """).content
-    return {"answer": answer, "source_used": "web_search", "trace": add_trace(state, "Answer generation → WEB SEARCH")}
+
+    return {
+        "answer": answer,
+        "source_used": "web_search",
+        "citations": state.get("citations", []),
+        "trace": add_trace(
+            state,
+            "Answer generation → WEB SEARCH"
+        ),
+    }
 
 def direct_answer(state: AgentState):
-    answer = llm().invoke(f"Respond briefly and naturally to: {state['question']}").content
-    return {"answer": answer, "source_used": "direct", "trace": add_trace(state, "Direct response → no retrieval")}
+    answer = llm().invoke(f"""
+You are a friendly enterprise IT support assistant.
+
+Respond briefly and naturally to the user's conversational message.
+This function is ONLY for greetings, thanks, acknowledgements, and casual small talk.
+Do not provide technical instructions or make up company policies.
+
+User message: {state['question']}
+""").content
+
+    return {
+        "answer": answer,
+        "source_used": "direct",
+        "citations": [],
+        "trace": add_trace(state, "Direct response → no retrieval"),
+    }
 
 def insufficient(state: AgentState):
     return {
-        "answer": "I couldn't find enough reliable evidence in the company knowledge base or external search to answer confidently. Please contact the IT help desk or provide more details.",
+        "answer": (
+            "I couldn't find enough reliable information in the company "
+            "knowledge base or external sources to answer your question confidently. "
+            "Please try rephrasing your question, provide more details, "
+            "or contact the IT help desk for assistance."
+        ),
         "source_used": "insufficient_evidence",
-        "trace": add_trace(state, "Stopped → insufficient reliable evidence"),
+        "citations": [],
+        "trace": add_trace(
+            state,
+            "Stopped → insufficient reliable evidence"
+        ),
     }
 
 def build_graph():
